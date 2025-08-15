@@ -1,6 +1,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # app.py — Copy Envelope (PySide6 + qdarkstyle)
-# Knobs pequeños (x10 precisión), barra con seek+volumen, autoplay al cargar
+# Gating drástico (sin Mix/Floor/Depth): solo suena dentro de segmentos.
+# Knobs pequeños (Attack/Release) + BPM al lado, barra con seek + volumen, autoplay.
 # Moldes embebidos en assets/molds (overrides opcionales en Molds/)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -18,8 +19,8 @@ from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QListWidget, QListWidgetItem, QFormLayout, QComboBox,
-    QDoubleSpinBox, QGroupBox, QAbstractItemView, QSlider, QDial, QStyle
+    QFileDialog, QListWidget, QListWidgetItem, QComboBox,
+    QGroupBox, QAbstractItemView, QSlider, QDial, QStyle, QDoubleSpinBox
 )
 
 try:
@@ -56,7 +57,7 @@ RUNTIME_MOLDS_DIR = (RUNTIME_DIR / "Molds")  # overrides si existe
 class Segment:
     start: float  # beats
     end: float    # beats
-    level: float  # 0..1
+    level: float  # 0..1 (opcional, por si usas acentos)
 
 @dataclass
 class Mold:
@@ -85,7 +86,7 @@ def load_mold_from_json(path: Path) -> Mold:
 
 
 # ----------------------------
-# Motor de audio
+# Motor de audio: GATE DURO
 # ----------------------------
 class GateFollower:
     def __init__(self, sr: int):
@@ -124,12 +125,7 @@ class PlayerThread(threading.Thread):
         self.followers: List[GateFollower] = []
         self.attack_ms = 10.0
         self.release_ms = 60.0
-        self.depth = 1.0
-        self.floor_db = -24.0
-        self.mix = 1.0
         self.playing = False
-
-        # progreso
         self.total_seconds = 0.0
 
     def set_audio(self, path: Path):
@@ -143,10 +139,6 @@ class PlayerThread(threading.Thread):
     def set_master(self, val: float): self.master_gain = float(val)
     def set_bpm(self, bpm: float): self.bpm = max(20.0, float(bpm))
     def set_ar(self, attack_ms: float, release_ms: float): self.attack_ms, self.release_ms = float(attack_ms), float(release_ms)
-    def set_depth_floor_mix(self, depth: float, floor_db: float, mix: float):
-        self.depth = float(np.clip(depth, 0, 1))
-        self.floor_db = float(floor_db)
-        self.mix = float(np.clip(mix, 0, 1))
     def set_molds(self, molds: List[Mold]):
         self.active_molds = molds
         self.followers = [GateFollower(self.sr) for _ in molds]
@@ -176,6 +168,7 @@ class PlayerThread(threading.Thread):
         end = start + frames
         y = np.zeros((frames, a.shape[1]), dtype=np.float32)
 
+        # loop con crossfade corto
         if end <= n:
             y[:] = a[start:end]
         else:
@@ -187,14 +180,15 @@ class PlayerThread(threading.Thread):
             if xf > 0:
                 w = np.linspace(0, 1, xf, dtype=np.float32)
                 y[n1 - xf:n1] = (1 - w)[:, None] * y[n1 - xf:n1] + w[:, None] * y[:xf]
-
         self.pos = (end % n)
 
+        # fase en beats
         spb = self.sr * 60.0 / self.bpm
         inc = 1.0 / spb
         phase = (self.phase_beats + inc * np.arange(frames, dtype=np.float32)) % self.length_beats
         self.phase_beats = float((self.phase_beats + inc * frames) % self.length_beats)
 
+        # GATE duro: si hay molds activos, solo suena donde env>0 (con AR)
         if self.active_molds:
             gains = np.ones(frames, dtype=np.float32)
             for mold, fol in zip(self.active_molds, self.followers):
@@ -202,14 +196,12 @@ class PlayerThread(threading.Thread):
                 for seg in mold.segments:
                     mask = (phase >= seg.start) & (phase < seg.end)
                     lvl = float(seg.level) if seg.level is not None else 1.0
-                    tgt[mask] = np.maximum(tgt[mask], lvl)
-                env = fol.process(tgt, self.attack_ms, self.release_ms)
-                floor_lin = 10.0 ** (self.floor_db / 20.0)
-                g = floor_lin + (env ** 1.0) * (1.0 - floor_lin) * self.depth
-                gains *= g.astype(np.float32)
-            wet = (y * gains[:, None])
-            out = (1.0 - self.mix) * y + self.mix * wet
+                    tgt[mask] = np.maximum(tgt[mask], lvl)  # si hay acentos
+                env = fol.process(tgt, self.attack_ms, self.release_ms)  # 0..1
+                gains *= env.astype(np.float32)  # SIN Floor/Mix/Depth: puro env
+            out = y * gains[:, None]
         else:
+            # sin molds: pasar directo
             out = y
 
         out *= self.master_gain
@@ -287,22 +279,25 @@ class App(QWidget):
         prog_row.addWidget(self.sld_vol)
         main.addLayout(prog_row)
 
-        # Global (BPM + Mix)
-        g_mix = QGroupBox("Global"); f = QFormLayout(g_mix)
-        self.spin_bpm = QDoubleSpinBox(); self.spin_bpm.setRange(20, 260); self.spin_bpm.setValue(100.0); self.spin_bpm.setDecimals(1)
-        self.sld_mix = QSlider(Qt.Horizontal); self.sld_mix.setRange(0,100); self.sld_mix.setValue(100)
-        f.addRow("BPM", self.spin_bpm)
-        f.addRow("Mix (wet)", self.sld_mix)
-        main.addWidget(g_mix)
-
-        # Dinámica (KNOBS) — mismos, mitad de tamaño, alta resolución (×10)
+        # Dinámica (Attack / Release knobs + BPM al lado)
         g_dyn = QGroupBox("Dinámica"); dyn = QHBoxLayout(g_dyn)
+
+        # Knobs homogéneos: mitad de tamaño, menos sensibilidad (scale=10)
         self.kn_attack = self._make_knob(0, 300, 10, "Attack", "ms", scale=10)
         self.kn_release = self._make_knob(0, 800, 60, "Release", "ms", scale=10)
-        self.kn_depth  = self._make_knob(0, 100, 100, "Depth", "%",  scale=10)
-        self.kn_floor  = self._make_knob(-60, 0, -24, "Floor", "dB",  scale=10)
-        for w in (self.kn_attack, self.kn_release, self.kn_depth, self.kn_floor):
+        for w in (self.kn_attack, self.kn_release):
             dyn.addWidget(w["wrap"])
+
+        # BPM al lado (spin)
+        bpm_col = QVBoxLayout()
+        bpm_lbl = QLabel("BPM"); bpm_lbl.setAlignment(Qt.AlignCenter)
+        self.spin_bpm = QDoubleSpinBox()
+        self.spin_bpm.setRange(20, 260); self.spin_bpm.setDecimals(1); self.spin_bpm.setValue(100.0)
+        self.spin_bpm.setFixedWidth(80)
+        bpm_box = QWidget(); bpm_box.setLayout(QVBoxLayout()); bpm_box.layout().setContentsMargins(0,0,0,0)
+        bpm_box.layout().addWidget(bpm_lbl); bpm_box.layout().addWidget(self.spin_bpm, alignment=Qt.AlignCenter)
+        dyn.addWidget(bpm_box)
+
         main.addWidget(g_dyn)
 
         # Moldes (solo filtro por género)
@@ -335,12 +330,9 @@ class App(QWidget):
 
         self.sld_vol.valueChanged.connect(self.on_master)
         self.spin_bpm.valueChanged.connect(self.on_bpm)
-        self.sld_mix.valueChanged.connect(self.on_mix)
 
         self.kn_attack["dial"].valueChanged.connect(self.on_ar)
         self.kn_release["dial"].valueChanged.connect(self.on_ar)
-        self.kn_depth["dial"].valueChanged.connect(self.on_depth_floor_mix)
-        self.kn_floor["dial"].valueChanged.connect(self.on_depth_floor_mix)
 
         self.cmb_genre.currentIndexChanged.connect(self.refresh_list)
         self.btn_reload.clicked.connect(self.load_all_molds)
@@ -353,47 +345,32 @@ class App(QWidget):
 
         # Timer para refrescar barra de progreso
         self.timer = QTimer(self)
-        self.timer.setInterval(50)  # 20 fps
+        self.timer.setInterval(50)  # ~20 fps
         self.timer.timeout.connect(self._tick_progress)
         self.timer.start()
 
         # Init
         self.load_all_molds()
-        self.on_master(); self.on_bpm(); self.on_mix(); self.on_ar(); self.on_depth_floor_mix()
+        self.on_master(); self.on_bpm(); self.on_ar()
         self._user_seeking = False
 
     # ---- helpers UI
     def _make_knob(self, minv:int, maxv:int, init:float, label:str, unit:str, scale:int=10):
-        """
-        Knob homogéneo:
-          - Tamaño 40x40 (mitad de antes)
-          - Escala 'scale' -> más resolución (menos sensibilidad)
-          - Muestra valor en tiempo real debajo
-        """
         dial = QDial()
         dial.setNotchesVisible(True)
         dial.setWrapping(False)
-        dial.setFixedSize(40, 40)  # mitad de tamaño
-        # mapping int <-> valor real
+        dial.setFixedSize(40, 40)  # compacto
         rng = (maxv - minv)
         dial.setRange(0, int(rng * scale))
         dial.setSingleStep(1)
         dial.setValue(int((init - minv) * scale))
 
         title = QLabel(label); title.setAlignment(Qt.AlignCenter)
-        val_lbl = QLabel("")   ; val_lbl.setAlignment(Qt.AlignCenter)
+        val_lbl = QLabel("");   val_lbl.setAlignment(Qt.AlignCenter)
 
-        # actualiza etiqueta con valor real
         def update_label():
             val = minv + dial.value() / float(scale)
-            if unit == "%":
-                val_lbl.setText(f"{val:0.1f} {unit}")
-            elif unit == "ms":
-                val_lbl.setText(f"{val:0.1f} {unit}")
-            elif unit == "dB":
-                val_lbl.setText(f"{val:0.1f} {unit}")
-            else:
-                val_lbl.setText(f"{val:0.2f} {unit}")
+            val_lbl.setText(f"{val:0.1f} {unit}")
         dial.valueChanged.connect(update_label)
         update_label()
 
@@ -403,7 +380,6 @@ class App(QWidget):
 
         return {"wrap": box, "dial": dial, "min": minv, "max": maxv, "scale": scale, "val_lbl": val_lbl}
 
-    # conversion helpers
     def _kn_val(self, k) -> float:
         return k["min"] + k["dial"].value() / float(k["scale"])
 
@@ -464,16 +440,11 @@ class App(QWidget):
     def on_master(self):
         self.player.set_master(self.sld_vol.value()/100.0)
 
-    def on_bpm(self): self.player.set_bpm(self.spin_bpm.value())
-    def on_mix(self):
-        depth_pct = self._kn_val(self.kn_depth)   # 0..100
-        floor_db = self._kn_val(self.kn_floor)    # -60..0
-        self.player.set_depth_floor_mix(depth_pct/100.0, floor_db, self.sld_mix.value()/100.0)
+    def on_bpm(self):
+        self.player.set_bpm(self.spin_bpm.value())
 
     def on_ar(self):
         self.player.set_ar(self._kn_val(self.kn_attack), self._kn_val(self.kn_release))
-
-    def on_depth_floor_mix(self): self.on_mix()
 
     def apply_selected_molds(self):
         sel = self.list_molds.selectedIndexes()
