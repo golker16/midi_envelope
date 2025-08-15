@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "tempo": 100,
+  "barBeats": 16,          // 4 barras x 4 beats
+  "segments": [
+    {"startBeat": 0.000, "endBeat": 0.480, "level": 1.0},
+    {"startBeat": 1.200, "endBeat": 1.400, "level": 1.0}
+  ]
+}
