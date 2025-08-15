@@ -1,0 +1,50 @@
+name: Build Windows EXE (onedir + assets)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+
+      - name: Ensure assets exist
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "assets/app.ico")) { Write-Warning "assets/app.ico no encontrado (usará ícono por defecto del exe)" }
+          if (-not (Test-Path "assets/app.png")) { Write-Warning "assets/app.png no encontrado (ventana sin ícono custom)" }
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build (PyInstaller spec)
+        shell: pwsh
+        run: pyinstaller app.spec
+
+      - name: List dist
+        shell: pwsh
+        run: Get-ChildItem -Recurse dist | Format-Table -AutoSize
+
+      - name: Upload artifact (onedir)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CopyEnvelope_onedir
+          path: dist/CopyEnvelope
+          if-no-files-found: error
