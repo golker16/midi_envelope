@@ -1,8 +1,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # app.py — Copy Envelope (PySide6 + qdarkstyle)
-# Gating drástico (sin Mix/Floor/Depth): solo suena dentro de segmentos.
-# Knobs pequeños (Attack/Release) + BPM al lado, barra con seek + volumen, autoplay.
-# Moldes embebidos en assets/molds (overrides opcionales en Molds/)
+# Gate drástico (sin Mix/Floor/Depth). Knobs A/R + BPM, barra con seek+volumen.
+# Clic en molde = toggle + aplicar inmediato. Limpiar selección. Drag&Drop audio.
+# Moldes embebidos en assets/molds (overrides opcionales en Molds/).
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtCore import Qt, QTimer, QSize, QEvent
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -57,7 +57,7 @@ RUNTIME_MOLDS_DIR = (RUNTIME_DIR / "Molds")  # overrides si existe
 class Segment:
     start: float  # beats
     end: float    # beats
-    level: float  # 0..1 (opcional, por si usas acentos)
+    level: float  # 0..1 (opcional)
 
 @dataclass
 class Mold:
@@ -188,7 +188,7 @@ class PlayerThread(threading.Thread):
         phase = (self.phase_beats + inc * np.arange(frames, dtype=np.float32)) % self.length_beats
         self.phase_beats = float((self.phase_beats + inc * frames) % self.length_beats)
 
-        # GATE duro: si hay molds activos, solo suena donde env>0 (con AR)
+        # GATE duro: pasa solo env (con AR); si hay varios moldes, multiplica
         if self.active_molds:
             gains = np.ones(frames, dtype=np.float32)
             for mold, fol in zip(self.active_molds, self.followers):
@@ -196,12 +196,11 @@ class PlayerThread(threading.Thread):
                 for seg in mold.segments:
                     mask = (phase >= seg.start) & (phase < seg.end)
                     lvl = float(seg.level) if seg.level is not None else 1.0
-                    tgt[mask] = np.maximum(tgt[mask], lvl)  # si hay acentos
+                    tgt[mask] = np.maximum(tgt[mask], lvl)
                 env = fol.process(tgt, self.attack_ms, self.release_ms)  # 0..1
-                gains *= env.astype(np.float32)  # SIN Floor/Mix/Depth: puro env
+                gains *= env.astype(np.float32)
             out = y * gains[:, None]
         else:
-            # sin molds: pasar directo
             out = y
 
         out *= self.master_gain
@@ -231,6 +230,8 @@ class App(QWidget):
 
         self.player = PlayerThread(); self.player.start()
         self.all_molds: List[Mold] = []; self.filtered_molds: List[Mold] = []
+
+        self.setAcceptDrops(True)  # Drag&Drop para cargar audio
 
         main = QVBoxLayout(self)
 
@@ -309,14 +310,17 @@ class App(QWidget):
 
         self.list_molds = QListWidget()
         self.list_molds.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.list_molds.installEventFilter(self)  # para toggle con clic simple
         lm.addWidget(self.list_molds)
         main.addWidget(g_molds)
 
-        # Botonera inferior
+        # Botonera inferior: Recargar + Limpiar selección
         bot = QHBoxLayout()
         self.btn_reload = QPushButton("Recargar moldes")
-        self.btn_apply = QPushButton("Aplicar selección")
-        bot.addWidget(self.btn_reload); bot.addStretch(1); bot.addWidget(self.btn_apply)
+        self.btn_clear  = QPushButton("Limpiar selección")
+        bot.addWidget(self.btn_reload)
+        bot.addWidget(self.btn_clear)
+        bot.addStretch(1)
         main.addLayout(bot)
 
         # Footer
@@ -336,7 +340,7 @@ class App(QWidget):
 
         self.cmb_genre.currentIndexChanged.connect(self.refresh_list)
         self.btn_reload.clicked.connect(self.load_all_molds)
-        self.btn_apply.clicked.connect(self.apply_selected_molds)
+        self.btn_clear.clicked.connect(self.clear_selection)
 
         # Progreso / seek
         self.sld_progress.sliderPressed.connect(self._pause_ui_seek)
@@ -396,6 +400,11 @@ class App(QWidget):
         return files
 
     def load_all_molds(self):
+        # preservar selección por nombre si refrescamos
+        selected_names = {self.list_molds.item(i).text().split()[0]
+                          for i in range(self.list_molds.count())
+                          if self.list_molds.item(i).isSelected()} if self.list_molds.count() else set()
+
         self.all_molds.clear()
         genres = set()
         files = self.find_all_mold_files()
@@ -414,28 +423,58 @@ class App(QWidget):
         idx = self.cmb_genre.findText(current)
         self.cmb_genre.setCurrentIndex(idx if idx >= 0 else 0)
         self.cmb_genre.blockSignals(False)
-        self.refresh_list()
+        self.refresh_list(preserve=selected_names)
 
-    def refresh_list(self):
+    def refresh_list(self, preserve: set | None = None):
         genre = self.cmb_genre.currentText()
         self.list_molds.clear(); self.filtered_molds = []
         for m in self.all_molds:
             if genre != "Todos" and m.genre != genre: continue
             item = QListWidgetItem(f"{m.name}  [{m.genre} {m.group_id} {m.family}]")
+            # restaurar selección si corresponde
+            if preserve and m.name in preserve:
+                item.setSelected(True)
             self.list_molds.addItem(item)
             self.filtered_molds.append(m)
+        self.apply_current_selection()
 
-    # ---- Slots
+    # ---- Selección inmediata
+    def eventFilter(self, obj, ev):
+        if obj is self.list_molds and ev.type() == QEvent.MouseButtonPress:
+            item = self.list_molds.itemAt(ev.pos())
+            if item is not None:
+                # toggle manual y aplicar en el acto
+                sel = item.isSelected()
+                item.setSelected(not sel)
+                self.apply_current_selection()
+                return True  # consumir el evento para evitar el toggle por defecto
+        return super().eventFilter(obj, ev)
+
+    def apply_current_selection(self):
+        molds = []
+        # mapear selección a self.filtered_molds por índice
+        for i in range(self.list_molds.count()):
+            if self.list_molds.item(i).isSelected():
+                molds.append(self.filtered_molds[i])
+        self.player.set_molds(molds)
+
+    def clear_selection(self):
+        for i in range(self.list_molds.count()):
+            self.list_molds.item(i).setSelected(False)
+        self.apply_current_selection()
+
+    # ---- Slots audio
     def on_load_audio(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Cargar audio", str(Path.home()), "Audio (*.wav *.aiff *.aif)")
         if fn:
-            self.player.set_audio(Path(fn))
-            # rango de progreso
-            dur = int(round(self.player.total_seconds))
-            self.sld_progress.setRange(0, max(dur, 0))
-            self.lbl_dur.setText(self._fmt_time(self.player.total_seconds))
-            # autoplay
-            self.player.set_play(True)
+            self._load_and_play(Path(fn))
+
+    def _load_and_play(self, path: Path):
+        self.player.set_audio(path)
+        dur = int(round(self.player.total_seconds))
+        self.sld_progress.setRange(0, max(dur, 0))
+        self.lbl_dur.setText(self._fmt_time(self.player.total_seconds))
+        self.player.set_play(True)
 
     def on_master(self):
         self.player.set_master(self.sld_vol.value()/100.0)
@@ -445,11 +484,6 @@ class App(QWidget):
 
     def on_ar(self):
         self.player.set_ar(self._kn_val(self.kn_attack), self._kn_val(self.kn_release))
-
-    def apply_selected_molds(self):
-        sel = self.list_molds.selectedIndexes()
-        molds = [self.filtered_molds[i.row()] for i in sel]
-        self.player.set_molds(molds)
 
     # ---- Progreso / Seek
     def _tick_progress(self):
@@ -477,6 +511,24 @@ class App(QWidget):
         s = sec % 60
         return f"{m:02d}:{s:02d}"
 
+    # ---- Drag & Drop de audio
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            for url in e.mimeData().urls():
+                suf = url.toLocalFile().lower()
+                if suf.endswith((".wav", ".aiff", ".aif")):
+                    e.acceptProposedAction()
+                    return
+        e.ignore()
+
+    def dropEvent(self, e):
+        for url in e.mimeData().urls():
+            f = Path(url.toLocalFile())
+            if f.suffix.lower() in (".wav", ".aiff", ".aif") and f.exists():
+                self._load_and_play(f)
+                break
+        e.acceptProposedAction()
+
     def closeEvent(self, e):
         self.player.stop()
         super().closeEvent(e)
@@ -489,9 +541,10 @@ def main():
             app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6"))
         except Exception:
             pass
-    w = App(); w.resize(980, 720); w.show()
+    w = App(); w.resize(530, 720); w.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()
+
 
