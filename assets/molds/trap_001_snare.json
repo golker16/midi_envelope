@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "units": "beats",
+  "lengthBeats": 16,
+  "loop": true,
+  "segments": [
+    { "start": 0.000, "end": 0.125, "level": 1.0 },
+    { "start": 1.000, "end": 1.125, "level": 1.0 },
+    { "start": 2.000, "end": 2.125, "level": 1.0 },
+    { "start": 3.000, "end": 3.125, "level": 1.0 },
+
+    { "start": 4.000, "end": 4.125, "level": 1.0 },
+    { "start": 5.000, "end": 5.125, "level": 1.0 },
+    { "start": 6.000, "end": 6.125, "level": 1.0 },
+    { "start": 7.000, "end": 7.125, "level": 1.0 },
+
+    { "start": 8.000, "end": 8.125, "level": 1.0 },
+    { "start": 9.000, "end": 9.125, "level": 1.0 },
+    { "start": 10.000, "end": 10.125, "level": 1.0 },
+    { "start": 11.000, "end": 11.125, "level": 1.0 },
+
+    { "start": 12.000, "end": 12.125, "level": 1.0 },
+    { "start": 13.000, "end": 13.125, "level": 1.0 },
+    { "start": 14.000, "end": 14.125, "level": 1.0 },
+    { "start": 15.000, "end": 15.125, "level": 1.0 }
+  ],
+  "suggestedTempo": 100
+}
