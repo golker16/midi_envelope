@@ -16,7 +16,7 @@ import sounddevice as sd
 import soundfile as sf
 
 from PySide6.QtCore import Qt, QTimer, QSize, QEvent
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QListWidget, QListWidgetItem, QComboBox,
@@ -94,7 +94,6 @@ class GateFollower:
         self.env = 0.0
 
     def process(self, target: np.ndarray, attack_ms: float, release_ms: float) -> np.ndarray:
-        # ataque/relax en segundos → coeficientes (sin clicks, estable)
         attack = max(attack_ms, 0.0) / 1000.0
         release = max(release_ms, 0.0) / 1000.0
         a_up = np.exp(-1.0 / (self.sr * max(attack, 1e-6)))
@@ -139,80 +138,83 @@ class PlayerThread(threading.Thread):
 
     def set_master(self, val: float): self.master_gain = float(val)
     def set_bpm(self, bpm: float): self.bpm = max(20.0, float(bpm))
-
-    def set_ar(self, attack_ms: float, release_ms: float):
-        self.attack_ms = float(attack_ms); self.release_ms = float(release_ms)
-
+    def set_ar(self, attack_ms: float, release_ms: float): self.attack_ms, self.release_ms = float(attack_ms), float(release_ms)
     def set_molds(self, molds: List[Mold]):
-        self.active_molds = list(molds)
-        self.followers = [GateFollower(self.sr) for _ in self.active_molds]
+        self.active_molds = molds
+        self.followers = [GateFollower(self.sr) for _ in molds]
+        self.length_beats = min([m.length_beats for m in molds]) if molds else 16.0
+    def set_play(self, flag: bool): self.playing = bool(flag)
 
-    def set_play(self, flag: bool):
-        self.playing = bool(flag)
+    def seek_seconds(self, t_sec: float):
+        if self.audio is None: return
+        t_sec = max(0.0, min(float(t_sec), self.total_seconds))
+        self.pos = int(t_sec * self.sr) % len(self.audio)
+        spb = self.sr * 60.0 / self.bpm
+        self.phase_beats = ((self.pos) / spb) % self.length_beats
+
+    def current_seconds(self) -> float:
+        if self.audio is None: return 0.0
+        return self.pos / float(self.sr)
+
+    # audio callback
+    def _callback(self, outdata, frames, time_info, status):
+        if self.audio is None or not self.playing:
+            outdata[:] = 0
+            return
+
+        a = self.audio
+        n = len(a)
+        start = self.pos
+        end = start + frames
+        y = np.zeros((frames, a.shape[1]), dtype=np.float32)
+
+        # loop con crossfade corto
+        if end <= n:
+            y[:] = a[start:end]
+        else:
+            n1 = n - start
+            n2 = frames - n1
+            y[:n1] = a[start:n]
+            y[n1:] = a[:n2]
+            xf = min(self.loop_xfade, n1, n2)
+            if xf > 0:
+                w = np.linspace(0, 1, xf, dtype=np.float32)
+                y[n1 - xf:n1] = (1 - w)[:, None] * y[n1 - xf:n1] + w[:, None] * y[:xf]
+        self.pos = (end % n)
+
+        # fase en beats
+        spb = self.sr * 60.0 / self.bpm
+        inc = 1.0 / spb
+        phase = (self.phase_beats + inc * np.arange(frames, dtype=np.float32)) % self.length_beats
+        self.phase_beats = float((self.phase_beats + inc * frames) % self.length_beats)
+
+        # GATE duro: pasa solo env (con AR); si hay varios moldes, multiplica
+        if self.active_molds:
+            gains = np.ones(frames, dtype=np.float32)
+            for mold, fol in zip(self.active_molds, self.followers):
+                tgt = np.zeros(frames, dtype=np.float32)
+                for seg in mold.segments:
+                    mask = (phase >= seg.start) & (phase < seg.end)
+                    lvl = float(seg.level) if seg.level is not None else 1.0
+                    tgt[mask] = np.maximum(tgt[mask], lvl)
+                env = fol.process(tgt, self.attack_ms, self.release_ms)  # 0..1
+                gains *= env.astype(np.float32)
+            out = y * gains[:, None]
+        else:
+            out = y
+
+        out *= self.master_gain
+        outdata[:] = out
 
     def run(self):
-        while not self.stop_flag.is_set():
-            if not self.playing or self.audio is None:
-                time.sleep(0.01)
-                continue
-            chunk = self._render_chunk(1024)
-            if chunk is None:
-                time.sleep(0.01)
-                continue
-            try:
-                sd.play(chunk, self.sr, blocking=False)
-            except Exception:
-                pass  # en CI o sin dispositivo de audio
-
-    def _render_chunk(self, n: int):
-        if self.audio is None: return None
-        a = self.audio
-        start = self.pos
-        end = start + n
-        if end > len(a):
-            # loop con crossfade cortito
-            head = a[start:len(a)]
-            tail = a[0:(end - len(a))]
-            x = np.vstack([head, tail])
-            if len(x) == 0: return None
-            # crossfade 10ms
-            L = min(self.loop_xfade, len(tail))
-            if L > 0:
-                w = np.linspace(0, 1, L, dtype=np.float32)
-                x[-L:, :] = (1 - w[:, None]) * x[-L:, :] + w[:, None] * a[:L, :]
-            self.pos = (end - len(a))
-        else:
-            x = a[start:end]
-            self.pos = end
-
-        # fase en beats (para 16 beats por defecto)
-        dt = n / float(self.sr)
-        beats_per_sample = self.bpm / 60.0 / self.sr
-        # construir máscara de gate por cada molde activo
-        if self.active_molds:
-            gate = np.ones(n, dtype=np.float32)
-            t_beats = (np.arange(n, dtype=np.float32) + 0) * beats_per_sample
-            for mold, follower in zip(self.active_molds, self.followers):
-                target = np.zeros(n, dtype=np.float32)
-                # a partir de group_id/length_beats, colocamos segmentos repetidos en el loop
-                for seg in mold.segments:
-                    # modulo a la longitud del patrón
-                    # (asumimos loop de 16 beats; si el molde es más largo, recorta)
-                    start_b = float(seg.start) % mold.length_beats
-                    end_b   = float(seg.end)   % mold.length_beats
-                    # convertimos t_beats modulo del molde
-                    tb = (t_beats + self.phase_beats) % mold.length_beats
-                    mask = (tb >= start_b) & (tb < end_b)
-                    target[mask] = max(0.0, min(1.0, float(seg.level)))
-                env = follower.process(target, self.attack_ms, self.release_ms)
-                gate *= env
-            x = x * gate[:, None]
-
-        # ganancia master
-        x = x * self.master_gain
-        # actualizar fase (en beats)
-        self.phase_beats = (self.phase_beats + n * beats_per_sample) % 16.0
-        return x
+        block = 1024
+        with sd.OutputStream(
+            samplerate=self.sr, channels=2, dtype="float32",
+            blocksize=block, callback=self._callback
+        ):
+            while not self.stop_flag.is_set():
+                time.sleep(0.05)
+    def stop(self): self.stop_flag.set()
 
 
 # ----------------------------
@@ -233,12 +235,6 @@ class App(QWidget):
 
         main = QVBoxLayout(self)
 
-        # Logo centrado arriba (assets/logo.png si existe)
-        self.logo_label = QLabel("")
-        self.logo_label.setAlignment(Qt.AlignCenter)
-        main.addWidget(self.logo_label)
-        self._load_logo()
-
         # Transporte (botones compactos con iconos)
         top = QHBoxLayout()
         self.btn_load = QPushButton("Cargar audio…")
@@ -255,17 +251,27 @@ class App(QWidget):
         self.btn_stop.setFixedSize(28, 28)
         self.btn_stop.setToolTip("Stop")
 
-        top.addWidget(self.btn_load); top.addSpacing(6)
-        top.addWidget(self.btn_play); top.addWidget(self.btn_stop)
+        top.addWidget(self.btn_load)
+        top.addSpacing(8)
+        top.addWidget(self.btn_play)
+        top.addWidget(self.btn_stop)
         top.addStretch(1)
         main.addLayout(top)
 
-        # Progreso / volumen
-        self.lbl_time = QLabel("00:00")
-        self.lbl_dur  = QLabel("00:00")
-        self.sld_progress = QSlider(Qt.Horizontal); self.sld_progress.setRange(0, 0)
-        self.sld_vol = QSlider(Qt.Horizontal); self.sld_vol.setRange(0, 100); self.sld_vol.setValue(100)
+        # Barra de reproducción + Volumen integrado
         prog_row = QHBoxLayout()
+        self.lbl_time = QLabel("00:00")
+        self.sld_progress = QSlider(Qt.Horizontal)
+        self.sld_progress.setRange(0, 0)  # se ajusta al cargar audio
+        self.sld_progress.setSingleStep(1)
+        self.sld_progress.setPageStep(5)
+        self.sld_progress.setTracking(False)
+        self.lbl_dur = QLabel("00:00")
+
+        self.sld_vol = QSlider(Qt.Horizontal)  # volumen junto a la barra
+        self.sld_vol.setRange(0, 100); self.sld_vol.setValue(80)
+        self.sld_vol.setFixedWidth(140)
+
         prog_row.addWidget(self.lbl_time)
         prog_row.addWidget(self.sld_progress, 1)
         prog_row.addWidget(self.lbl_dur)
@@ -295,16 +301,11 @@ class App(QWidget):
 
         main.addWidget(g_dyn)
 
-        # Moldes (filtro por género + shot)
+        # Moldes (solo filtro por género)
         g_molds = QGroupBox("Moldes"); lm = QVBoxLayout(g_molds)
         filt = QHBoxLayout()
         self.cmb_genre = QComboBox(); self.cmb_genre.addItem("Todos")
-        filt.addWidget(QLabel("Género:")); filt.addWidget(self.cmb_genre)
-        # Filtro adicional: Shot (family)
-        self.cmb_shot = QComboBox(); self.cmb_shot.addItem("Todos")
-        filt.addSpacing(12)
-        filt.addWidget(QLabel("Shot:")); filt.addWidget(self.cmb_shot)
-        filt.addStretch(1)
+        filt.addWidget(QLabel("Género:")); filt.addWidget(self.cmb_genre); filt.addStretch(1)
         lm.addLayout(filt)
 
         self.list_molds = QListWidget()
@@ -338,55 +339,55 @@ class App(QWidget):
         self.kn_release["dial"].valueChanged.connect(self.on_ar)
 
         self.cmb_genre.currentIndexChanged.connect(self.refresh_list)
-        self.cmb_shot.currentIndexChanged.connect(self.refresh_list)
         self.btn_reload.clicked.connect(self.load_all_molds)
         self.btn_clear.clicked.connect(self.clear_selection)
 
         # Progreso / seek
-        self._progress_timer = QTimer(self); self._progress_timer.timeout.connect(self._tick_progress); self._progress_timer.start(80)
-        self.sld_progress.sliderPressed.connect(self._seek_press)
-        self.sld_progress.sliderReleased.connect(self._seek_release)
-        self._seeking = False
+        self.sld_progress.sliderPressed.connect(self._pause_ui_seek)
+        self.sld_progress.sliderReleased.connect(self._apply_seek)
+        self.sld_progress.valueChanged.connect(self._preview_time_label)
 
-        # Inicial
+        # Timer para refrescar barra de progreso
+        self.timer = QTimer(self)
+        self.timer.setInterval(50)  # ~20 fps
+        self.timer.timeout.connect(self._tick_progress)
+        self.timer.start()
+
+        # Init
         self.load_all_molds()
+        self.on_master(); self.on_bpm(); self.on_ar()
+        self._user_seeking = False
 
-    # ---- Widgets utilitarios
-    def _make_knob(self, minv, maxv, defv, title, unit, scale=1):
-        wrap = QWidget(); col = QVBoxLayout(wrap); col.setContentsMargins(0,0,0,0)
-        dial = QDial(); dial.setMinimum(minv); dial.setMaximum(maxv); dial.setValue(defv); dial.setNotchesVisible(True)
-        lab = QLabel(f"{title}: {defv}{unit}"); lab.setAlignment(Qt.AlignCenter)
-        def upd(v): lab.setText(f"{title}: {v}{unit}")
-        dial.valueChanged.connect(upd)
-        col.addWidget(dial); col.addWidget(lab)
-        return {"wrap": wrap, "dial": dial, "label": lab}
+    # ---- helpers UI
+    def _make_knob(self, minv:int, maxv:int, init:float, label:str, unit:str, scale:int=10):
+        dial = QDial()
+        dial.setNotchesVisible(True)
+        dial.setWrapping(False)
+        dial.setFixedSize(40, 40)  # compacto
+        rng = (maxv - minv)
+        dial.setRange(0, int(rng * scale))
+        dial.setSingleStep(1)
+        dial.setValue(int((init - minv) * scale))
 
-    # ---- Logo methods
-    def _load_logo(self):
-        p = asset_path("logo.png")
-        if p is None: 
-            self.logo_label.hide()
-            return
-        pm = QPixmap(str(p))
-        if pm.isNull():
-            self.logo_label.hide()
-            return
-        self._logo_pix = pm
-        self.logo_label.show()
-        self._update_logo_pixmap()
+        title = QLabel(label); title.setAlignment(Qt.AlignCenter)
+        val_lbl = QLabel("");   val_lbl.setAlignment(Qt.AlignCenter)
 
-    def _update_logo_pixmap(self):
-        if hasattr(self, "_logo_pix"):
-            # altura objetivo ~80 px
-            h = 80
-            self.logo_label.setPixmap(self._logo_pix.scaledToHeight(h, Qt.SmoothTransformation))
+        def update_label():
+            val = minv + dial.value() / float(scale)
+            val_lbl.setText(f"{val:0.1f} {unit}")
+        dial.valueChanged.connect(update_label)
+        update_label()
 
-    def resizeEvent(self, ev):
-        # mantener logo escalado
-        self._update_logo_pixmap()
-        return super().resizeEvent(ev)
+        box = QWidget()
+        lay = QVBoxLayout(box); lay.setContentsMargins(0,0,0,0)
+        lay.addWidget(title); lay.addWidget(dial, alignment=Qt.AlignCenter); lay.addWidget(val_lbl)
 
-    # ---- Carga/refresh de moldes
+        return {"wrap": box, "dial": dial, "min": minv, "max": maxv, "scale": scale, "val_lbl": val_lbl}
+
+    def _kn_val(self, k) -> float:
+        return k["min"] + k["dial"].value() / float(k["scale"])
+
+    # ---- Carga de moldes (embebidos + overrides)
     def find_all_mold_files(self) -> Dict[str, Path]:
         files: Dict[str, Path] = {}
         for d in EMBED_MOLDS_DIRS:
@@ -400,50 +401,36 @@ class App(QWidget):
 
     def load_all_molds(self):
         # preservar selección por nombre si refrescamos
-        selected_names = set()
-        if self.list_molds.count():
-            for i in range(self.list_molds.count()):
-                if self.list_molds.item(i).isSelected() and i < len(self.filtered_molds):
-                    selected_names.add(self.filtered_molds[i].name)
+        selected_names = {self.list_molds.item(i).text().split()[0]
+                          for i in range(self.list_molds.count())
+                          if self.list_molds.item(i).isSelected()} if self.list_molds.count() else set()
 
         self.all_molds.clear()
         genres = set()
-        shots = set()
         files = self.find_all_mold_files()
         for p in files.values():
             try:
                 m = load_mold_from_json(p)
                 self.all_molds.append(m)
                 genres.add(m.genre)
-                shots.add(m.family)
             except Exception as e:
                 print("Error leyendo", p, e)
 
-        # actualizar combos preservando selección
-        self.cmb_genre.blockSignals(True); self.cmb_shot.blockSignals(True)
-        current_genre = self.cmb_genre.currentText() if self.cmb_genre.count() else "Todos"
-        current_shot  = self.cmb_shot.currentText()  if hasattr(self, 'cmb_shot') and self.cmb_shot.count() else "Todos"
+        self.cmb_genre.blockSignals(True)
+        current = self.cmb_genre.currentText() if self.cmb_genre.count() else "Todos"
         self.cmb_genre.clear(); self.cmb_genre.addItem("Todos")
         for g in sorted(genres): self.cmb_genre.addItem(g)
-        self.cmb_shot.clear(); self.cmb_shot.addItem("Todos")
-        for s in sorted(shots): self.cmb_shot.addItem(s)
-        idxg = self.cmb_genre.findText(current_genre)
-        idxs = self.cmb_shot.findText(current_shot)
-        self.cmb_genre.setCurrentIndex(idxg if idxg >= 0 else 0)
-        self.cmb_shot.setCurrentIndex(idxs if idxs >= 0 else 0)
-        self.cmb_genre.blockSignals(False); self.cmb_shot.blockSignals(False)
+        idx = self.cmb_genre.findText(current)
+        self.cmb_genre.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cmb_genre.blockSignals(False)
         self.refresh_list(preserve=selected_names)
 
     def refresh_list(self, preserve: set | None = None):
         genre = self.cmb_genre.currentText()
-        shot  = self.cmb_shot.currentText() if hasattr(self, 'cmb_shot') else "Todos"
         self.list_molds.clear(); self.filtered_molds = []
         for m in self.all_molds:
             if genre != "Todos" and m.genre != genre: continue
-            if shot  != "Todos" and m.family != shot: continue
-            # Texto bonito: "ID GENRE FAMILY" -> "001 pop perc"
-            item = QListWidgetItem(f"{m.group_id} {m.genre} {m.family}")
-            item.setToolTip(m.name)  # nombre real del archivo
+            item = QListWidgetItem(f"{m.name}  [{m.genre} {m.group_id} {m.family}]")
             # restaurar selección si corresponde
             if preserve and m.name in preserve:
                 item.setSelected(True)
@@ -489,35 +476,37 @@ class App(QWidget):
         self.lbl_dur.setText(self._fmt_time(self.player.total_seconds))
         self.player.set_play(True)
 
-    def on_master(self, v):
-        self.player.set_master(v/100.0)
+    def on_master(self):
+        self.player.set_master(self.sld_vol.value()/100.0)
 
-    def on_bpm(self, v):
-        self.player.set_bpm(v)
+    def on_bpm(self):
+        self.player.set_bpm(self.spin_bpm.value())
 
-    def on_ar(self, _):
-        self.player.set_ar(self.kn_attack["dial"].value(), self.kn_release["dial"].value())
+    def on_ar(self):
+        self.player.set_ar(self._kn_val(self.kn_attack), self._kn_val(self.kn_release))
 
-    # ---- Progreso
+    # ---- Progreso / Seek
     def _tick_progress(self):
-        if self.player is None or self.player.audio is None: return
-        if not self._seeking:
+        if getattr(self, "_user_seeking", False):
+            return
+        sec = self.player.current_seconds()
+        self.lbl_time.setText(self._fmt_time(sec))
+        if self.sld_progress.maximum() > 0:
             self.sld_progress.blockSignals(True)
-            sec = int(round(self.player.pos / float(self.player.sr)))
-            self.sld_progress.setValue(sec)
-            self.lbl_time.setText(self._fmt_time(sec))
+            self.sld_progress.setValue(int(sec))
             self.sld_progress.blockSignals(False)
 
-    def _seek_press(self):
-        self._seeking = True
+    def _pause_ui_seek(self): self._user_seeking = True
+    def _apply_seek(self):
+        val = self.sld_progress.value()
+        self.player.seek_seconds(val)
+        self._user_seeking = False
+    def _preview_time_label(self):
+        if getattr(self, "_user_seeking", False):
+            self.lbl_time.setText(self._fmt_time(self.sld_progress.value()))
 
-    def _seek_release(self):
-        sec = self.sld_progress.value()
-        self.player.pos = int(sec * self.player.sr)
-        self._seeking = False
-
-    def _fmt_time(self, secf: float | int) -> str:
-        sec = int(round(secf))
+    def _fmt_time(self, sec: float) -> str:
+        sec = int(sec)
         m = sec // 60
         s = sec % 60
         return f"{m:02d}:{s:02d}"
@@ -534,9 +523,16 @@ class App(QWidget):
 
     def dropEvent(self, e):
         for url in e.mimeData().urls():
-            p = Path(url.toLocalFile())
-            if p.suffix.lower() in (".wav", ".aiff", ".aif"):
-                self._load_and_play(p)
+            f = Path(url.toLocalFile())
+            if f.suffix.lower() in (".wav", ".aiff", ".aif") and f.exists():
+                self._load_and_play(f)
+                break
+        e.acceptProposedAction()
+
+    def closeEvent(self, e):
+        self.player.stop()
+        super().closeEvent(e)
+
 
 def main():
     app = QApplication(sys.argv)
@@ -550,5 +546,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
