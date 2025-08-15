@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # app.py — Copy Envelope (PySide6 + qdarkstyle)
-# Knobs (QDial) para dinámica + Barra de reproducción con seek y volumen
-# Moldes embebidos en assets/molds (con overrides opcionales en Molds/)
+# Knobs pequeños (x10 precisión), barra con seek+volumen, autoplay al cargar
+# Moldes embebidos en assets/molds (overrides opcionales en Molds/)
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -14,12 +14,12 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QListWidget, QListWidgetItem, QFormLayout, QComboBox,
-    QDoubleSpinBox, QGroupBox, QCheckBox, QAbstractItemView, QSlider, QDial
+    QDoubleSpinBox, QGroupBox, QAbstractItemView, QSlider, QDial, QStyle
 )
 
 try:
@@ -129,7 +129,7 @@ class PlayerThread(threading.Thread):
         self.mix = 1.0
         self.playing = False
 
-        # para GUI (progreso)
+        # progreso
         self.total_seconds = 0.0
 
     def set_audio(self, path: Path):
@@ -157,7 +157,6 @@ class PlayerThread(threading.Thread):
         if self.audio is None: return
         t_sec = max(0.0, min(float(t_sec), self.total_seconds))
         self.pos = int(t_sec * self.sr) % len(self.audio)
-        # re-sincroniza fase en beats con la posición
         spb = self.sr * 60.0 / self.bpm
         self.phase_beats = ((self.pos) / spb) % self.length_beats
 
@@ -243,26 +242,39 @@ class App(QWidget):
 
         main = QVBoxLayout(self)
 
-        # Transporte
+        # Transporte (botones compactos con iconos)
         top = QHBoxLayout()
         self.btn_load = QPushButton("Cargar audio…")
-        self.btn_play = QPushButton("Play")
-        self.btn_stop = QPushButton("Stop")
-        top.addWidget(self.btn_load); top.addWidget(self.btn_play); top.addWidget(self.btn_stop)
+
+        self.btn_play = QPushButton()
+        self.btn_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.btn_play.setIconSize(QSize(18, 18))
+        self.btn_play.setFixedSize(28, 28)
+        self.btn_play.setToolTip("Play")
+
+        self.btn_stop = QPushButton()
+        self.btn_stop.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.btn_stop.setIconSize(QSize(18, 18))
+        self.btn_stop.setFixedSize(28, 28)
+        self.btn_stop.setToolTip("Stop")
+
+        top.addWidget(self.btn_load)
+        top.addSpacing(8)
+        top.addWidget(self.btn_play)
+        top.addWidget(self.btn_stop)
+        top.addStretch(1)
         main.addLayout(top)
 
         # Barra de reproducción + Volumen integrado
-        #   - progress: 0..duración (seg)
-        #   - volume: slider pequeño al lado
         prog_row = QHBoxLayout()
         self.lbl_time = QLabel("00:00")
         self.sld_progress = QSlider(Qt.Horizontal)
         self.sld_progress.setRange(0, 0)  # se ajusta al cargar audio
         self.sld_progress.setSingleStep(1)
         self.sld_progress.setPageStep(5)
-        self.sld_progress.setTracking(False)  # evita spam mientras arrastras
-
+        self.sld_progress.setTracking(False)
         self.lbl_dur = QLabel("00:00")
+
         self.sld_vol = QSlider(Qt.Horizontal)  # volumen junto a la barra
         self.sld_vol.setRange(0, 100); self.sld_vol.setValue(80)
         self.sld_vol.setFixedWidth(140)
@@ -283,30 +295,25 @@ class App(QWidget):
         f.addRow("Mix (wet)", self.sld_mix)
         main.addWidget(g_mix)
 
-        # Dinámica (KNOBS)
+        # Dinámica (KNOBS) — mismos, mitad de tamaño, alta resolución (×10)
         g_dyn = QGroupBox("Dinámica"); dyn = QHBoxLayout(g_dyn)
-        self.kn_attack = self._make_knob(0, 300, 10, "Attack\n(ms)")
-        self.kn_release = self._make_knob(0, 800, 60, "Release\n(ms)")
-        self.kn_depth = self._make_knob(0, 100, 100, "Depth\n(%)")
-        self.kn_floor = self._make_knob(-60, 0, -24, "Floor\n(dB)")
+        self.kn_attack = self._make_knob(0, 300, 10, "Attack", "ms", scale=10)
+        self.kn_release = self._make_knob(0, 800, 60, "Release", "ms", scale=10)
+        self.kn_depth  = self._make_knob(0, 100, 100, "Depth", "%",  scale=10)
+        self.kn_floor  = self._make_knob(-60, 0, -24, "Floor", "dB",  scale=10)
         for w in (self.kn_attack, self.kn_release, self.kn_depth, self.kn_floor):
             dyn.addWidget(w["wrap"])
         main.addWidget(g_dyn)
 
-        # Moldes
+        # Moldes (solo filtro por género)
         g_molds = QGroupBox("Moldes"); lm = QVBoxLayout(g_molds)
         filt = QHBoxLayout()
         self.cmb_genre = QComboBox(); self.cmb_genre.addItem("Todos")
-        self.chk_kick = QCheckBox("kick"); self.chk_kick.setChecked(True)
-        self.chk_snare = QCheckBox("snare/clap"); self.chk_snare.setChecked(True)
-        self.chk_hats = QCheckBox("hats"); self.chk_hats.setChecked(True)
-        self.chk_other = QCheckBox("other"); self.chk_other.setChecked(True)
         filt.addWidget(QLabel("Género:")); filt.addWidget(self.cmb_genre); filt.addStretch(1)
-        for w in (self.chk_kick, self.chk_snare, self.chk_hats, self.chk_other): filt.addWidget(w)
         lm.addLayout(filt)
 
         self.list_molds = QListWidget()
-        self.list_molds.setSelectionMode(QAbstractItemView.MultiSelection)  # FIX correcto
+        self.list_molds.setSelectionMode(QAbstractItemView.MultiSelection)
         lm.addWidget(self.list_molds)
         main.addWidget(g_molds)
 
@@ -321,12 +328,12 @@ class App(QWidget):
         footer = QLabel("© 2025 Gabriel Golker"); footer.setAlignment(Qt.AlignCenter)
         main.addWidget(footer)
 
-        # Signals
+        # Señales
         self.btn_load.clicked.connect(self.on_load_audio)
         self.btn_play.clicked.connect(lambda: self.player.set_play(True))
         self.btn_stop.clicked.connect(lambda: self.player.set_play(False))
 
-        self.sld_vol.valueChanged.connect(self.on_master)         # volumen integrado en la barra
+        self.sld_vol.valueChanged.connect(self.on_master)
         self.spin_bpm.valueChanged.connect(self.on_bpm)
         self.sld_mix.valueChanged.connect(self.on_mix)
 
@@ -336,11 +343,6 @@ class App(QWidget):
         self.kn_floor["dial"].valueChanged.connect(self.on_depth_floor_mix)
 
         self.cmb_genre.currentIndexChanged.connect(self.refresh_list)
-        self.chk_kick.stateChanged.connect(self.refresh_list)
-        self.chk_snare.stateChanged.connect(self.refresh_list)
-        self.chk_hats.stateChanged.connect(self.refresh_list)
-        self.chk_other.stateChanged.connect(self.refresh_list)
-
         self.btn_reload.clicked.connect(self.load_all_molds)
         self.btn_apply.clicked.connect(self.apply_selected_molds)
 
@@ -358,22 +360,52 @@ class App(QWidget):
         # Init
         self.load_all_molds()
         self.on_master(); self.on_bpm(); self.on_mix(); self.on_ar(); self.on_depth_floor_mix()
-
-        self._user_seeking = False  # flag temporal durante drag
+        self._user_seeking = False
 
     # ---- helpers UI
-    def _make_knob(self, minv:int, maxv:int, init:int, label:str):
-        wrap = QVBoxLayout()
+    def _make_knob(self, minv:int, maxv:int, init:float, label:str, unit:str, scale:int=10):
+        """
+        Knob homogéneo:
+          - Tamaño 40x40 (mitad de antes)
+          - Escala 'scale' -> más resolución (menos sensibilidad)
+          - Muestra valor en tiempo real debajo
+        """
         dial = QDial()
-        dial.setMinimum(minv); dial.setMaximum(maxv); dial.setValue(init)
         dial.setNotchesVisible(True)
         dial.setWrapping(False)
-        # tamaño cómodo
-        dial.setFixedSize(80, 80)
-        cap = QLabel(label); cap.setAlignment(Qt.AlignCenter)
-        box = QWidget(); lay = QVBoxLayout(box); lay.setContentsMargins(0,0,0,0)
-        lay.addWidget(dial, alignment=Qt.AlignCenter); lay.addWidget(cap)
-        return {"wrap": box, "dial": dial, "label": cap}
+        dial.setFixedSize(40, 40)  # mitad de tamaño
+        # mapping int <-> valor real
+        rng = (maxv - minv)
+        dial.setRange(0, int(rng * scale))
+        dial.setSingleStep(1)
+        dial.setValue(int((init - minv) * scale))
+
+        title = QLabel(label); title.setAlignment(Qt.AlignCenter)
+        val_lbl = QLabel("")   ; val_lbl.setAlignment(Qt.AlignCenter)
+
+        # actualiza etiqueta con valor real
+        def update_label():
+            val = minv + dial.value() / float(scale)
+            if unit == "%":
+                val_lbl.setText(f"{val:0.1f} {unit}")
+            elif unit == "ms":
+                val_lbl.setText(f"{val:0.1f} {unit}")
+            elif unit == "dB":
+                val_lbl.setText(f"{val:0.1f} {unit}")
+            else:
+                val_lbl.setText(f"{val:0.2f} {unit}")
+        dial.valueChanged.connect(update_label)
+        update_label()
+
+        box = QWidget()
+        lay = QVBoxLayout(box); lay.setContentsMargins(0,0,0,0)
+        lay.addWidget(title); lay.addWidget(dial, alignment=Qt.AlignCenter); lay.addWidget(val_lbl)
+
+        return {"wrap": box, "dial": dial, "min": minv, "max": maxv, "scale": scale, "val_lbl": val_lbl}
+
+    # conversion helpers
+    def _kn_val(self, k) -> float:
+        return k["min"] + k["dial"].value() / float(k["scale"])
 
     # ---- Carga de moldes (embebidos + overrides)
     def find_all_mold_files(self) -> Dict[str, Path]:
@@ -410,16 +442,9 @@ class App(QWidget):
 
     def refresh_list(self):
         genre = self.cmb_genre.currentText()
-        fam_ok = set()
-        if self.chk_kick.isChecked(): fam_ok.add("kick")
-        if self.chk_snare.isChecked(): fam_ok.add("snare")
-        if self.chk_hats.isChecked(): fam_ok.add("hats")
-        if self.chk_other.isChecked(): fam_ok.add("other")
-
         self.list_molds.clear(); self.filtered_molds = []
         for m in self.all_molds:
             if genre != "Todos" and m.genre != genre: continue
-            if m.family not in fam_ok: continue
             item = QListWidgetItem(f"{m.name}  [{m.genre} {m.group_id} {m.family}]")
             self.list_molds.addItem(item)
             self.filtered_molds.append(m)
@@ -429,23 +454,25 @@ class App(QWidget):
         fn, _ = QFileDialog.getOpenFileName(self, "Cargar audio", str(Path.home()), "Audio (*.wav *.aiff *.aif)")
         if fn:
             self.player.set_audio(Path(fn))
-            # set up progress bar range
+            # rango de progreso
             dur = int(round(self.player.total_seconds))
             self.sld_progress.setRange(0, max(dur, 0))
             self.lbl_dur.setText(self._fmt_time(self.player.total_seconds))
+            # autoplay
+            self.player.set_play(True)
 
     def on_master(self):
         self.player.set_master(self.sld_vol.value()/100.0)
 
     def on_bpm(self): self.player.set_bpm(self.spin_bpm.value())
     def on_mix(self):
-        # depth y floor vienen de knobs; aquí solo actualizo mix
-        self.player.set_depth_floor_mix(self.kn_depth["dial"].value()/100.0,
-                                        self.kn_floor["dial"].value(),
-                                        self.sld_mix.value()/100.0)
+        depth_pct = self._kn_val(self.kn_depth)   # 0..100
+        floor_db = self._kn_val(self.kn_floor)    # -60..0
+        self.player.set_depth_floor_mix(depth_pct/100.0, floor_db, self.sld_mix.value()/100.0)
+
     def on_ar(self):
-        self.player.set_ar(self.kn_attack["dial"].value(),
-                           self.kn_release["dial"].value())
+        self.player.set_ar(self._kn_val(self.kn_attack), self._kn_val(self.kn_release))
+
     def on_depth_floor_mix(self): self.on_mix()
 
     def apply_selected_molds(self):
@@ -455,7 +482,7 @@ class App(QWidget):
 
     # ---- Progreso / Seek
     def _tick_progress(self):
-        if self._user_seeking:  # no pisar mientras arrastra
+        if getattr(self, "_user_seeking", False):
             return
         sec = self.player.current_seconds()
         self.lbl_time.setText(self._fmt_time(sec))
@@ -464,16 +491,13 @@ class App(QWidget):
             self.sld_progress.setValue(int(sec))
             self.sld_progress.blockSignals(False)
 
-    def _pause_ui_seek(self):
-        self._user_seeking = True
-
+    def _pause_ui_seek(self): self._user_seeking = True
     def _apply_seek(self):
         val = self.sld_progress.value()
         self.player.seek_seconds(val)
         self._user_seeking = False
-
     def _preview_time_label(self):
-        if self._user_seeking:
+        if getattr(self, "_user_seeking", False):
             self.lbl_time.setText(self._fmt_time(self.sld_progress.value()))
 
     def _fmt_time(self, sec: float) -> str:
@@ -494,7 +518,7 @@ def main():
             app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6"))
         except Exception:
             pass
-    w = App(); w.resize(960, 700); w.show()
+    w = App(); w.resize(980, 720); w.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
