@@ -1,0 +1,11 @@
+# GUI
+PySide6
+qdarkstyle
+
+# Audio + DSP
+numpy
+sounddevice
+soundfile
+
+# (Opcional) si luego agregas importador MIDI → JSON
+mido
